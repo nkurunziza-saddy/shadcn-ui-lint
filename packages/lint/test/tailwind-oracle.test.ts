@@ -2,9 +2,12 @@
 // classes generate CSS. Tested directly (async, no worker) here; the
 // synchronous bridge is exercised by the no-unknown-classes rule tests.
 
+import * as fs from "node:fs"
+import Module, { createRequire } from "node:module"
+import * as os from "node:os"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
-import { describe, expect, test } from "vitest"
+import { describe, expect, test, vi } from "vitest"
 
 import { query, resetOracle, resolveStylesheet } from "../src/tailwind/oracle"
 import { PROJECT } from "./helpers"
@@ -123,6 +126,69 @@ describe("tailwind oracle", () => {
     expect(answer.unknown).toEqual([
       { token: "p-crad", suggestion: "p-card", baseKnown: false },
     ])
+  })
+
+  // In a workspace the app's stylesheet can import only a design system
+  // package's stylesheet, and that package alone depends on Tailwind. A
+  // strict package manager then installs Tailwind beside the package, where
+  // neither the app's directory nor the working directory reaches it.
+  test("finds Tailwind beside the workspace package that imports it", async () => {
+    const root = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), "shadcn-lint-workspace-"))
+    )
+    const write = (file: string, content: string) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
+      fs.writeFileSync(path.join(root, file), content)
+    }
+    const link = (target: string, file: string) => {
+      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
+      fs.symlinkSync(target, path.join(root, file), "junction")
+    }
+    write("apps/web/src/app.css", '@import "@acme/ui/styles.css";\n')
+    write(
+      "packages/ui/package.json",
+      JSON.stringify({
+        name: "@acme/ui",
+        exports: { "./styles.css": "./src/styles.css" },
+      })
+    )
+    write(
+      "packages/ui/src/styles.css",
+      '@import "tailwindcss";\n\n@utility kit-frame {\n  outline: 1px dashed currentColor;\n}\n'
+    )
+    link(path.join(root, "packages/ui"), "apps/web/node_modules/@acme/ui")
+    link(
+      path.dirname(
+        createRequire(import.meta.url).resolve("tailwindcss/package.json")
+      ),
+      "packages/ui/node_modules/tailwindcss"
+    )
+    const cwd = vi.spyOn(process, "cwd").mockReturnValue(root)
+    // A pnpm bin shim puts its hoisted modules on NODE_PATH, which would
+    // find Tailwind here whatever the fixture holds. Launchers that skip
+    // the shim (an editor, Vite+) leave it unset.
+    const nodePath = process.env.NODE_PATH
+    const initPaths = (Module as unknown as { _initPaths(): void })._initPaths
+    delete process.env.NODE_PATH
+    initPaths()
+    try {
+      resetOracle()
+      const answer = await query(path.join(root, "apps/web/src/app.css"), [
+        "flex",
+        "kit-frame",
+        "kit-frmae",
+      ])
+      expect(answer.ok).toBe(true)
+      if (!answer.ok) return
+      expect(answer.unknown).toEqual([
+        { token: "kit-frmae", suggestion: "kit-frame", baseKnown: false },
+      ])
+    } finally {
+      if (nodePath !== undefined) process.env.NODE_PATH = nodePath
+      initPaths()
+      cwd.mockRestore()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
 
   test("a theme that cannot be read is unavailable, not wrong", async () => {

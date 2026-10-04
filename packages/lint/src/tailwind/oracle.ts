@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url"
 
 import { splitVariants } from "../grammar/classes"
 import { didYouMean } from "../grammar/similar"
+import { parseImports } from "../project/css"
 
 type DesignSystem = {
   theme?: { prefix?: string | null }
@@ -80,32 +81,40 @@ function resolveFrom(base: string, id: string) {
   return createRequire(path.join(base, "noop.js")).resolve(id)
 }
 
-// Resolved from the stylesheet outward: ours is not a substitute for the
-// version that actually generates the project's CSS.
-async function loadTailwind(dir: string): Promise<Tailwind | null> {
-  for (const from of [dir, process.cwd()]) {
-    let resolved: string
+function resolveTailwind(dirs: string[]) {
+  for (const from of dirs) {
     try {
-      resolved = resolveFrom(from, "tailwindcss")
+      return resolveFrom(from, "tailwindcss")
     } catch {
       continue
     }
-    // Tailwind's entry is CommonJS: its API may sit on `default`.
-    const mod = (await import(pathToFileURL(resolved).href)) as {
-      default?: Partial<Tailwind>
-    } & Partial<Tailwind>
-    const api =
-      typeof mod.__unstable__loadDesignSystem === "function"
-        ? mod
-        : typeof mod.default?.__unstable__loadDesignSystem === "function"
-          ? mod.default
-          : null
-    if (api) return api as Tailwind
-    throw new Error(
-      `${resolved} is not Tailwind v4 (no __unstable__loadDesignSystem)`
-    )
   }
   return null
+}
+
+// Resolved from the stylesheet outward: ours is not a substitute for the
+// version that actually generates the project's CSS. When neither the
+// entry's directory nor the working directory reaches one, the stylesheets
+// that import Tailwind say where it is installed.
+async function loadTailwind(cssFile: string): Promise<Tailwind | null> {
+  const resolved =
+    resolveTailwind([path.dirname(cssFile), process.cwd()]) ??
+    resolveTailwind(tailwindImporters(cssFile))
+  if (!resolved) return null
+  // Tailwind's entry is CommonJS: its API may sit on `default`.
+  const mod = (await import(pathToFileURL(resolved).href)) as {
+    default?: Partial<Tailwind>
+  } & Partial<Tailwind>
+  const api =
+    typeof mod.__unstable__loadDesignSystem === "function"
+      ? mod
+      : typeof mod.default?.__unstable__loadDesignSystem === "function"
+        ? mod.default
+        : null
+  if (api) return api as Tailwind
+  throw new Error(
+    `${resolved} is not Tailwind v4 (no __unstable__loadDesignSystem)`
+  )
 }
 
 function existingFile(candidate: string) {
@@ -234,6 +243,36 @@ function realpathOf(file: string) {
   }
 }
 
+// The directories of the stylesheets, from the entry inward, that import
+// Tailwind. In a workspace the entry can import only a design system
+// package's stylesheet while that package alone depends on Tailwind, and a
+// strict package manager installs it beside the package, not the app.
+function tailwindImporters(
+  cssFile: string,
+  seen = new Set<string>(),
+  dirs: string[] = []
+) {
+  if (seen.has(cssFile) || seen.size > 64) return dirs
+  seen.add(cssFile)
+  let css: string
+  try {
+    css = fs.readFileSync(cssFile, "utf-8")
+  } catch {
+    return dirs
+  }
+  const dir = path.dirname(cssFile)
+  for (const spec of parseImports(css)) {
+    if (spec === "tailwindcss" || spec.startsWith("tailwindcss/")) {
+      if (!dirs.includes(dir)) dirs.push(dir)
+      continue
+    }
+    if (/^(?:https?:|data:)/.test(spec)) continue
+    const resolved = resolveStylesheet(dir, spec)
+    if (resolved) tailwindImporters(realpathOf(resolved), seen, dirs)
+  }
+  return dirs
+}
+
 function mtimeOf(file: string) {
   try {
     return fs.statSync(file).mtimeMs
@@ -248,7 +287,7 @@ function signatureOf(files: string[]) {
 
 async function build(cssFile: string): Promise<Loaded> {
   const dir = path.dirname(cssFile)
-  const tailwind = await loadTailwind(dir)
+  const tailwind = await loadTailwind(cssFile)
   if (!tailwind) {
     throw new Error(`tailwindcss v4 could not be resolved from ${dir}`)
   }
